@@ -43,6 +43,9 @@ smooth_angle = 0.0
 # Set while recording, None otherwise.
 writer = None
 
+# Shared random source for the glitch effect.
+rng = np.random.default_rng()
+
 # Measured loop rate, so recordings play back at real speed.
 fps = None
 prev_time = None
@@ -90,28 +93,45 @@ def quad_points(cx, cy, w, h, angle):
     )
 
 
-def glow_line(image, p1, p2, thickness=1):
+def glow_polygon(image, pts, thickness=1):
     # Soft glow, no clutter.
-    glow = image.copy()
+    # Only the area around the outline is blurred, in a single pass,
+    # so the rest of the frame stays sharp and cheap to draw.
+    h, w = image.shape[:2]
+    pad = thickness * 3 + 8
 
-    cv2.line(
-        glow, p1, p2,
-        (255, 255, 255),
+    x1 = max(0, int(pts[:, 0].min()) - pad)
+    y1 = max(0, int(pts[:, 1].min()) - pad)
+    x2 = min(w, int(pts[:, 0].max()) + pad + 1)
+    y2 = min(h, int(pts[:, 1].max()) + pad + 1)
+
+    if x1 >= x2 or y1 >= y2:
+        return
+
+    roi = image[y1:y2, x1:x2]
+    local = (pts - (x1, y1)).astype(np.int32)
+
+    glow = np.zeros(roi.shape[:2], dtype=np.uint8)
+
+    cv2.polylines(
+        glow, [local], True,
+        255,
         thickness * 3,
         cv2.LINE_AA
     )
 
     glow = cv2.GaussianBlur(glow, (0, 0), 2)
 
-    cv2.addWeighted(
-        glow, 0.12,
-        image, 0.88,
-        0,
-        image
+    # Lighten towards white where the glow is, up to 12%.
+    lift = cv2.multiply(
+        cv2.bitwise_not(roi),
+        cv2.cvtColor(glow, cv2.COLOR_GRAY2BGR),
+        scale=0.12 / 255.0
     )
+    roi[:] = cv2.add(roi, lift)
 
-    cv2.line(
-        image, p1, p2,
+    cv2.polylines(
+        roi, [local], True,
         (245, 245, 245),
         thickness,
         cv2.LINE_AA
@@ -119,25 +139,20 @@ def glow_line(image, p1, p2, thickness=1):
 
 
 def get_face_data(face, width, height):
-    points = []
+    coords = np.array(
+        [(p.x, p.y) for p in face.landmark],
+        dtype=np.float32
+    ) * (width, height)
 
-    for p in face.landmark:
-        points.append((
-            int(np.clip(p.x * width, 0, width - 1)),
-            int(np.clip(p.y * height, 0, height - 1))
-        ))
+    pts = np.clip(coords, 0, (width - 1, height - 1)).astype(np.int32)
 
-    pts = np.array(points, dtype=np.int32)
-
-    x1 = int(np.min(pts[:, 0]))
-    y1 = int(np.min(pts[:, 1]))
-    x2 = int(np.max(pts[:, 0]))
-    y2 = int(np.max(pts[:, 1]))
+    x1, y1 = (int(v) for v in pts.min(axis=0))
+    x2, y2 = (int(v) for v in pts.max(axis=0))
 
     return pts, (x1, y1, x2, y2)
 
 
-def create_face_effect(frame, face_points, box, strong):
+def create_face_effect(frame, face_points, box):
     """Clean glitch effect that keeps the face readable."""
 
     h, w = frame.shape[:2]
@@ -171,9 +186,6 @@ def create_face_effect(frame, face_points, box, strong):
     hull = cv2.convexHull(local)
     cv2.fillConvexPoly(face_mask, hull, 255)
 
-    if not strong:
-        return frame
-
     # Darken the face area.
 
     base = crop.copy()
@@ -198,8 +210,6 @@ def create_face_effect(frame, face_points, box, strong):
     glitched = cv2.merge((b_shift, g, r_shift))
 
     # Slice the image for a glitchy look.
-
-    rng = np.random.default_rng()
 
     # Short slices, not full-frame distortion.
     for _ in range(55):
@@ -227,16 +237,7 @@ def create_face_effect(frame, face_points, box, strong):
 
     line_spacing = max(5, ch // 38)
 
-    for yy in range(0, ch, line_spacing):
-
-        cv2.line(
-            glitched,
-            (0, yy),
-            (cw, yy),
-            (220, 220, 220),
-            1,
-            cv2.LINE_AA
-        )
+    glitched[::line_spacing] = 220
 
     # Add quick digital bars.
 
@@ -305,13 +306,7 @@ def draw_face_hud(frame, box, angle=0.0):
     )
 
     # Thin, clean frame.
-    for i in range(4):
-        glow_line(
-            frame,
-            tuple(pts[i]),
-            tuple(pts[(i + 1) % 4]),
-            1
-        )
+    glow_polygon(frame, pts, 1)
 
     # Small corner markers.
     for p in pts:
@@ -522,38 +517,13 @@ try:
 
         if face_points is not None and face_box is not None:
 
-            frame = create_face_effect(
-                frame,
-                face_points,
-                face_box,
-                pinch
-            )
-
-            # The HUD follows the face by default.
-            hud_box = face_box
-
-            # If hands are controlling it, move the HUD center.
-            if fingertips:
-
-                x1, y1, x2, y2 = face_box
-
-                fw = x2 - x1
-                fh = y2 - y1
-
-                new_cx = int(smooth_cx)
-                new_cy = int(smooth_cy)
-
-                hud_w = int(fw * 1.65 * smooth_scale)
-                hud_h = int(fh * 1.75 * smooth_scale)
-
-                hud_box = (
-                    new_cx - hud_w // 2,
-                    new_cy - hud_h // 2,
-                    new_cx + hud_w // 2,
-                    new_cy + hud_h // 2
+            if pinch:
+                frame = create_face_effect(
+                    frame,
+                    face_points,
+                    face_box
                 )
 
-            if pinch:
                 x1, y1, x2, y2 = face_box
                 cx_face = (x1 + x2) // 2
                 cy_face = (y1 + y2) // 2
@@ -569,14 +539,30 @@ try:
                     angle
                 )
 
-                for i in range(4):
-                    glow_line(
-                        frame,
-                        tuple(scan_pts[i]),
-                        tuple(scan_pts[(i + 1) % 4]),
-                        1
-                    )
+                glow_polygon(frame, scan_pts, 1)
             else:
+                # The HUD follows the face by default.
+                hud_box = face_box
+
+                # If hands are controlling it, move the HUD center.
+                # draw_face_hud adds the margin, so only scale the face size here.
+                if fingertips:
+
+                    x1, y1, x2, y2 = face_box
+
+                    new_cx = int(smooth_cx)
+                    new_cy = int(smooth_cy)
+
+                    hud_w = int((x2 - x1) * smooth_scale)
+                    hud_h = int((y2 - y1) * smooth_scale)
+
+                    hud_box = (
+                        new_cx - hud_w // 2,
+                        new_cy - hud_h // 2,
+                        new_cx + hud_w // 2,
+                        new_cy + hud_h // 2
+                    )
+
                 draw_face_hud(
                     frame,
                     hud_box,
@@ -679,7 +665,7 @@ try:
                     + ".mp4"
                 )
 
-                fourcc = cv2.VideoWriter_fourcc(
+                fourcc = cv2.VideoWriter.fourcc(
                     *"mp4v"
                 )
 
