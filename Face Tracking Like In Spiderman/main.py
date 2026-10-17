@@ -5,7 +5,9 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import math
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 # Live spider-style face effect.
 
@@ -18,12 +20,68 @@ hands = mp_hands.Hands(
     min_tracking_confidence=0.55
 )
 
+# Iris landmarks are not used, so skip refining them.
 face_mesh = mp_face.FaceMesh(
     max_num_faces=1,
-    refine_landmarks=True,
+    refine_landmarks=False,
     min_detection_confidence=0.55,
     min_tracking_confidence=0.55
 )
+
+# Runs hand tracking alongside face tracking.
+tracker_pool = ThreadPoolExecutor(max_workers=1)
+
+WINDOW_NAME = "Spider Live Effect"
+RECORDINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
+
+# Tracking runs on a smaller copy of the frame. Landmarks come back
+# normalized, so they still map onto the full-size frame.
+MAX_TRACK_WIDTH = 640
+
+
+class CameraStream:
+    """Reads the camera on a background thread, so the main loop
+    always gets the newest frame instead of waiting for the camera."""
+
+    def __init__(self, cap):
+        self.cap = cap
+        self.cond = threading.Condition()
+        self.ok = True
+        self.frame = None
+        self.count = 0
+        self.running = True
+
+        self.thread = threading.Thread(target=self._update, daemon=True)
+        self.thread.start()
+
+    def _update(self):
+        while self.running:
+            ok, frame = self.cap.read()
+
+            with self.cond:
+                self.ok = ok
+                self.frame = frame
+                self.count += 1
+                self.cond.notify_all()
+
+            if not ok:
+                break
+
+    def read(self, last_count):
+        # Wait for a frame newer than the one returned last time.
+        with self.cond:
+            self.cond.wait_for(lambda: self.count != last_count, timeout=2.0)
+
+            if self.count == last_count:
+                return False, None, last_count
+
+            return self.ok, self.frame, self.count
+
+    def release(self):
+        self.running = False
+        self.thread.join(timeout=2.0)
+        self.cap.release()
+
 
 cap = cv2.VideoCapture(0)
 
@@ -33,8 +91,8 @@ if not cap.isOpened():
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 720)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-WINDOW_NAME = "Spider Live Effect"
-RECORDINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
+camera = CameraStream(cap)
+last_frame = 0
 
 smooth_cx = smooth_cy = None
 smooth_scale = 1.0
@@ -115,7 +173,7 @@ def glow_polygon(image, pts, thickness=1):
 
     cv2.polylines(
         glow, [local], True,
-        255,
+        (255,),
         thickness * 3,
         cv2.LINE_AA
     )
@@ -184,7 +242,7 @@ def create_face_effect(frame, face_points, box):
 
     face_mask = np.zeros((ch, cw), dtype=np.uint8)
     hull = cv2.convexHull(local)
-    cv2.fillConvexPoly(face_mask, hull, 255)
+    cv2.fillConvexPoly(face_mask, hull, (255,))
 
     # Darken the face area.
 
@@ -343,9 +401,9 @@ print()
 try:
     while True:
 
-        ok, frame = cap.read()
+        ok, frame, last_frame = camera.read(last_frame)
 
-        if not ok:
+        if not ok or frame is None:
             print("Camera stopped sending frames.")
             break
 
@@ -361,16 +419,26 @@ try:
 
         height, width = frame.shape[:2]
 
+        track_frame = frame
+
+        if width > MAX_TRACK_WIDTH:
+            track_frame = cv2.resize(
+                frame,
+                (MAX_TRACK_WIDTH, round(height * MAX_TRACK_WIDTH / width)),
+                interpolation=cv2.INTER_AREA
+            )
+
         rgb = cv2.cvtColor(
-            frame,
+            track_frame,
             cv2.COLOR_BGR2RGB
         )
 
         # Read-only input lets MediaPipe skip a copy.
         rgb.flags.writeable = False
 
+        hand_future = tracker_pool.submit(hands.process, rgb)
         face_results = face_mesh.process(rgb)
-        hand_results = hands.process(rgb)
+        hand_results = hand_future.result()
 
         # Face tracking.
 
@@ -708,7 +776,8 @@ finally:
     if writer is not None:
         writer.release()
 
-    cap.release()
+    camera.release()
+    tracker_pool.shutdown()
 
     hands.close()
     face_mesh.close()
