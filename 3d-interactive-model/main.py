@@ -1,4 +1,4 @@
-﻿import pyvista as pv
+import pyvista as pv
 
 # Create the viewer.
 plotter = pv.Plotter(window_size=[1024, 768], title="3D Interactive Viewer")
