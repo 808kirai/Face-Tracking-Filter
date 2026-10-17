@@ -7,36 +7,38 @@ import numpy as np
 import math
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
-# Live spider-style face effect.
+# Live hand portal effect.
+# Thumbs and index fingers of both hands frame a portal, and only the
+# inside of the portal is filtered. Each new framing shows the next filter.
 
-mp_hands = mp.solutions.hands
-mp_face = mp.solutions.face_mesh
-
-hands = mp_hands.Hands(
+hands = mp.solutions.hands.Hands(
     max_num_hands=2,
     min_detection_confidence=0.55,
     min_tracking_confidence=0.55
 )
 
-# Iris landmarks are not used, so skip refining them.
-face_mesh = mp_face.FaceMesh(
-    max_num_faces=1,
-    refine_landmarks=False,
-    min_detection_confidence=0.55,
-    min_tracking_confidence=0.55
-)
+# Person segmentation for the pop art filter, created when first needed.
+segmenter = None
 
-# Runs hand tracking alongside face tracking.
-tracker_pool = ThreadPoolExecutor(max_workers=1)
-
-WINDOW_NAME = "Spider Live Effect"
+WINDOW_NAME = "Portal Filter"
 RECORDINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
 
 # Tracking runs on a smaller copy of the frame. Landmarks come back
 # normalized, so they still map onto the full-size frame.
 MAX_TRACK_WIDTH = 640
+
+# Hand landmark indices.
+WRIST = 0
+THUMB_TIP = 4
+INDEX_TIP = 8
+
+# A gap longer than this counts as taking the hands away and framing again,
+# which moves on to the next filter.
+REFRAME_GAP = 0.4
+
+# Keep the last portal on screen through tracking dropouts this short.
+HOLD_TIME = 0.15
 
 
 class CameraStream:
@@ -145,22 +147,17 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 camera = CameraStream(cap)
 last_frame = 0
 
-# Smoothing for the face box and for the HUD's (center x, center y, scale).
-face_filter = OneEuroFilter(min_cutoff=0.5, beta=0.01)
-hud_filter = OneEuroFilter(min_cutoff=0.5, beta=0.01)
-smooth_angle = 0.0
+# Smooths the 4 fingertip corners (left thumb, left index, right thumb, right index).
+corner_filter = OneEuroFilter(min_cutoff=0.5, beta=0.01)
 
-# Pinch turns on below the lower ratio and only turns off above the
-# higher one, so it does not flicker near the threshold.
-PINCH_ON = 0.45
-PINCH_OFF = 0.65
-pinch = False
+# Last portal corners and when they were seen.
+portal = None
+portal_seen_at = None
+
+filtro_index = 0
 
 # Set while recording, None otherwise.
 writer = None
-
-# Shared random source for the glitch effect.
-rng = np.random.default_rng()
 
 # Measured loop rate, so recordings play back at real speed.
 fps = None
@@ -169,44 +166,8 @@ prev_time = None
 
 # Helpers.
 
-def distance(a, b):
-    return math.hypot(a[0] - b[0], a[1] - b[1])
-
-
 def lerp(a, b, amount):
     return a + (b - a) * amount
-
-
-def lerp_angle(a, b, amount):
-    # The HUD is a rectangle, so angles 180 degrees apart look the same.
-    # Taking the shortest turn stops it spinning when the hands swap order.
-    diff = (b - a + 90) % 180 - 90
-    return a + diff * amount
-
-
-def rotate_point(cx, cy, x, y, angle):
-    a = math.radians(angle)
-    dx = x - cx
-    dy = y - cy
-
-    return (
-        int(cx + dx * math.cos(a) - dy * math.sin(a)),
-        int(cy + dx * math.sin(a) + dy * math.cos(a))
-    )
-
-
-def quad_points(cx, cy, w, h, angle):
-    corners = [
-        (cx - w // 2, cy - h // 2),
-        (cx + w // 2, cy - h // 2),
-        (cx + w // 2, cy + h // 2),
-        (cx - w // 2, cy + h // 2)
-    ]
-
-    return np.array(
-        [rotate_point(cx, cy, x, y, angle) for x, y in corners],
-        dtype=np.int32
-    )
 
 
 def glow_polygon(image, pts, thickness=1):
@@ -254,201 +215,278 @@ def glow_polygon(image, pts, thickness=1):
     )
 
 
-def get_face_data(face, width, height):
-    coords = np.array(
-        [(p.x, p.y) for p in face.landmark],
-        dtype=np.float32
-    ) * (width, height)
+def order_corners(pts):
+    # Sort by angle around the centroid so the corners always
+    # make a polygon that does not cross itself.
+    center = pts.mean(axis=0)
+    angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
 
-    pts = np.clip(coords, 0, (width - 1, height - 1)).astype(np.int32)
-
-    x1, y1 = (int(v) for v in pts.min(axis=0))
-    x2, y2 = (int(v) for v in pts.max(axis=0))
-
-    return pts, (x1, y1, x2, y2)
+    return pts[np.argsort(angles)]
 
 
-def create_face_effect(frame, face_points, box):
-    """Clean glitch effect that keeps the face readable."""
+def get_portal_corners(hand_results, width, height):
+    # The 4 fingertips of a two-hand "camera frame" gesture,
+    # or None unless exactly two hands are visible.
+    landmarks = hand_results.multi_hand_landmarks
 
-    h, w = frame.shape[:2]
-    x1, y1, x2, y2 = box
+    if not landmarks or len(landmarks) != 2:
+        return None
 
-    fw = max(1, x2 - x1)
-    fh = max(1, y2 - y1)
+    # Left hand on screen first, so each corner keeps its identity
+    # from frame to frame and can be smoothed.
+    ordered = sorted(landmarks, key=lambda hand: hand.landmark[WRIST].x)
 
-    # Slightly wider crop, still centered on the face.
-    px = int(fw * 0.28)
-    py = int(fh * 0.42)
-
-    rx1 = max(0, x1 - px)
-    ry1 = max(0, y1 - py)
-    rx2 = min(w, x2 + px)
-    ry2 = min(h, y2 + py)
-
-    crop = frame[ry1:ry2, rx1:rx2].copy()
-
-    if crop.size == 0:
-        return frame
-
-    ch, cw = crop.shape[:2]
-
-    # Face mask.
-    local = face_points.copy()
-    local[:, 0] -= rx1
-    local[:, 1] -= ry1
-
-    face_mask = np.zeros((ch, cw), dtype=np.uint8)
-    hull = cv2.convexHull(local)
-    cv2.fillConvexPoly(face_mask, hull, (255,))
-
-    # Darken the face area.
-
-    base = crop.copy()
-
-    # Boost contrast without blur.
-    enhanced = cv2.convertScaleAbs(
-        base,
-        alpha=1.15,
-        beta=-18
+    return np.array(
+        [
+            (hand.landmark[tip].x * width, hand.landmark[tip].y * height)
+            for hand in ordered
+            for tip in (THUMB_TIP, INDEX_TIP)
+        ],
+        dtype=np.float64
     )
 
-    # Separate the RGB channels.
 
-    b, g, r = cv2.split(enhanced)
+# Filters.
+# Each takes a BGR image and returns a filtered BGR image of the same size.
 
-    shift_r = max(5, cw // 22)
-    shift_b = max(5, cw // 26)
+HALFTONE_LEVELS = 24
 
-    r_shift = np.roll(r, shift_r, axis=1)
-    b_shift = np.roll(b, -shift_b, axis=1)
+# Pre-rendered dot tiles, one per dot size, keyed by (cell, paper, ink).
+halftone_tiles = {}
 
-    glitched = cv2.merge((b_shift, g, r_shift))
 
-    # Slice the image for a glitchy look.
+def get_halftone_tiles(cell, paper, ink):
+    key = (cell, paper, ink)
 
-    # Short slices, not full-frame distortion.
-    for _ in range(55):
+    if key not in halftone_tiles:
+        # Distance from each pixel to the center of the cell.
+        d = np.arange(cell) - (cell - 1) / 2.0
+        dist = np.sqrt(d[:, None] ** 2 + d[None, :] ** 2)
 
-        yy = int(rng.integers(0, ch))
-        thickness = int(rng.integers(1, max(2, ch // 32)))
+        radius = np.linspace(0.0, cell * 0.72, HALFTONE_LEVELS)
 
-        y2s = min(ch, yy + thickness)
+        # Soft dot edges instead of jagged ones.
+        coverage = np.clip(radius[:, None, None] - dist + 0.5, 0.0, 1.0)[..., None]
 
-        # Stronger shift near the face.
-        offset = int(
-            rng.integers(
-                -max(5, cw // 12),
-                max(6, cw // 12)
-            )
-        )
+        paper_c = np.array(paper, dtype=np.float32)
+        ink_c = np.array(ink, dtype=np.float32)
 
-        glitched[yy:y2s] = np.roll(
-            glitched[yy:y2s],
-            offset,
-            axis=1
-        )
+        halftone_tiles[key] = (paper_c + (ink_c - paper_c) * coverage).astype(np.uint8)
 
-    # Add scan lines.
+    return halftone_tiles[key]
 
-    line_spacing = max(5, ch // 38)
 
-    glitched[::line_spacing] = 220
+def halftone(image, cell, paper, ink):
+    h, w = image.shape[:2]
 
-    # Add quick digital bars.
+    gray = cv2.equalizeHist(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
 
-    for _ in range(18):
+    # One dot per cell, bigger where the image is darker.
+    cells_w = -(-w // cell)
+    cells_h = -(-h // cell)
 
-        yy = int(rng.integers(0, ch))
-        bar_h = int(rng.integers(1, 4))
-        bar_w = int(rng.integers(max(12, cw // 10), max(13, cw // 2)))
+    small = cv2.resize(gray, (cells_w, cells_h), interpolation=cv2.INTER_AREA)
+    levels = ((255 - small.astype(np.int32)) * (HALFTONE_LEVELS - 1) + 127) // 255
 
-        xx = int(rng.integers(0, max(1, cw - bar_w)))
+    # Lay the matching dot tile into every cell, then trim to size.
+    tiles = get_halftone_tiles(cell, paper, ink)[levels]
+    out = tiles.transpose(0, 2, 1, 3, 4).reshape(cells_h * cell, cells_w * cell, 3)
 
-        cv2.rectangle(
-            glitched,
-            (xx, yy),
-            (min(cw - 1, xx + bar_w), min(ch - 1, yy + bar_h)),
-            (235, 235, 235),
-            -1
-        )
+    return np.ascontiguousarray(out[:h, :w])
 
-    # Blend the effect back in.
 
-    # Strongest on the face, softer around the edges.
-    face_alpha = face_mask.astype(np.float32) / 255.0
+def pink_halftone(image):
+    return halftone(image, 8, paper=(215, 185, 255), ink=(125, 10, 205))
 
-    # Keep the outer frame subtle.
-    outer_mask = cv2.GaussianBlur(face_mask, (0, 0), 12)
-    outer_alpha = outer_mask.astype(np.float32) / 255.0
 
-    alpha = (
-        face_alpha * 0.88 +
-        outer_alpha * 0.12
-    )[:, :, None]
+def wireframe_grid(image):
+    out = cv2.convertScaleAbs(image, alpha=0.75, beta=0)
 
-    base_f = base.astype(np.float32)
-    glitch_f = glitched.astype(np.float32)
+    step = max(12, min(image.shape[:2]) // 14)
 
-    result = (
-        base_f * (1.0 - alpha) +
-        glitch_f * alpha
-    ).astype(np.uint8)
+    out[::step] = (out[::step] * 0.2 + 255 * 0.8).astype(np.uint8)
+    out[:, ::step] = (out[:, ::step] * 0.2 + 255 * 0.8).astype(np.uint8)
 
-    frame[ry1:ry2, rx1:rx2] = result
+    return out
+
+
+# Colors for the pop art labels, as a lookup table.
+POP_ART_COLORS = np.zeros((256, 1, 3), dtype=np.uint8)
+POP_ART_COLORS[0] = (0, 140, 255)      # orange background
+POP_ART_COLORS[1] = (190, 30, 235)     # magenta subject
+POP_ART_COLORS[2] = (80, 0, 90)        # deep purple ink
+
+
+def pop_art(image):
+    global segmenter
+
+    # Created on first use, so the model only loads if this filter is shown.
+    if segmenter is None:
+        segmenter = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=1)
+
+    h, w = image.shape[:2]
+
+    # The model works at 256px anyway, so hand it a small copy
+    # and scale the mask back up.
+    scale = min(1.0, 256 / max(h, w))
+    small = cv2.resize(image, (max(1, round(w * scale)), max(1, round(h * scale))), interpolation=cv2.INTER_AREA)
+
+    rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+    rgb.flags.writeable = False
+
+    mask = cv2.resize(segmenter.process(rgb).segmentation_mask, (w, h), interpolation=cv2.INTER_LINEAR)
+    subject = mask > 0.5
+
+    # 0 = background, 1 = subject, 2 = ink.
+    label = subject.astype(np.uint8)
+
+    if subject.any():
+        gray = cv2.medianBlur(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), 5)
+
+        # Shadows from the subject's own brightness, plus local detail
+        # (eyes, mouth, outlines) that a single threshold would miss.
+        shadow = np.percentile(gray[subject], 25)
+
+        block = max(11, (min(gray.shape) // 16) | 1)
+        detail = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY_INV,
+            block, 6
+        ) > 0
+
+        label += subject & ((gray < shadow) | detail)
+
+    return cv2.LUT(cv2.merge((label, label, label)), POP_ART_COLORS)
+
+
+def newspaper(image):
+    return halftone(image, 7, paper=(232, 238, 240), ink=(25, 25, 25))
+
+
+def rgb_split(image):
+    b, g, r = cv2.split(image)
+
+    shift = max(4, image.shape[1] // 40)
+
+    out = cv2.merge((
+        np.roll(b, -shift, axis=1),
+        g,
+        np.roll(r, shift, axis=1)
+    ))
+
+    # Faint scan lines.
+    out[::3] = (out[::3] * 0.8).astype(np.uint8)
+
+    return out
+
+
+def thermal(image):
+    gray = cv2.equalizeHist(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
+
+    return cv2.applyColorMap(gray, cv2.COLORMAP_JET)
+
+
+# Sepia weights for BGR input. Rows are the output B, G, R channels.
+SEPIA = np.array([
+    [0.131, 0.534, 0.272],
+    [0.168, 0.686, 0.349],
+    [0.189, 0.769, 0.393]
+], dtype=np.float32)
+
+
+def sepia(image):
+    toned = cv2.transform(image, SEPIA)
+
+    # Slightly faded, like an old print.
+    return cv2.convertScaleAbs(toned, alpha=0.88, beta=18)
+
+
+def frosted_glass(image):
+    h, w = image.shape[:2]
+
+    # Blurring a quarter-size copy is much cheaper than a huge kernel.
+    small = cv2.resize(image, (max(1, w // 4), max(1, h // 4)), interpolation=cv2.INTER_AREA)
+    small = cv2.GaussianBlur(small, (0, 0), 3)
+    blurred = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    # White tint.
+    return cv2.convertScaleAbs(blurred, alpha=0.7, beta=255 * 0.3)
+
+
+FILTROS = [
+    pink_halftone,
+    wireframe_grid,
+    pop_art,
+    newspaper,
+    rgb_split,
+    thermal,
+    sepia,
+    frosted_glass
+]
+
+
+def filter_name(filtro):
+    return filtro.__name__.replace("_", " ").upper()
+
+
+def render_portal(frame, p1, p2, p3, p4, filtro):
+    """Applies filtro inside the quad p1-p4 and draws its outline."""
+
+    h, w = frame.shape[:2]
+    pts = np.array([p1, p2, p3, p4], dtype=np.int32)
+
+    # Only filter the portal's bounding box, not the whole frame.
+    x, y, bw, bh = cv2.boundingRect(pts)
+
+    x1 = max(0, x)
+    y1 = max(0, y)
+    x2 = min(w, x + bw)
+    y2 = min(h, y + bh)
+
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return frame
+
+    roi = frame[y1:y2, x1:x2]
+    filtered = filtro(roi.copy())
+
+    # fillPoly, unlike fillConvexPoly, also handles a skewed concave quad.
+    mask = np.zeros(roi.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(mask, [pts - (x1, y1)], (255,))
+
+    inside = mask > 0
+    roi[inside] = filtered[inside]
+
+    glow_polygon(frame, pts, 1)
 
     return frame
 
 
-def draw_face_hud(frame, box, angle=0.0):
-    x1, y1, x2, y2 = box
-
-    cx = (x1 + x2) // 2
-    cy = (y1 + y2) // 2
-
-    fw = x2 - x1
-    fh = y2 - y1
-
-    # Keep the HUD close to the face.
-    hw = int(fw * 1.65)
-    hh = int(fh * 1.75)
-
-    pts = quad_points(
-        cx,
-        cy,
-        hw,
-        hh,
-        angle
+def draw_label(frame, text, origin, scale=0.46):
+    cv2.putText(
+        frame,
+        text,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        (235, 235, 235),
+        1,
+        cv2.LINE_AA
     )
-
-    # Thin, clean frame.
-    glow_polygon(frame, pts, 1)
-
-    # Small corner markers.
-    for p in pts:
-        px, py = p
-
-        cv2.circle(
-            frame,
-            (px, py),
-            3,
-            (245, 245, 245),
-            -1,
-            cv2.LINE_AA
-        )
 
 
 # Start.
 
 print()
 print("==========================================")
-print("       LIVE SPIDER FACE EFFECT")
+print("            LIVE PORTAL FILTER")
 print("==========================================")
 print()
-print("1 HAND  -> move face HUD")
-print("2 HANDS -> resize + rotate HUD")
-print("PINCH   -> digital face mode")
+print("Frame with both hands: thumbs and index")
+print("fingers make the 4 corners of the portal.")
+print("Drop your hands and frame again for the next filter.")
 print()
+print("N / SPACE = next filter")
 print("R = record")
 print("Q / ESC = quit")
 print()
@@ -466,11 +504,9 @@ try:
             break
 
         now = time.perf_counter()
-        dt = 0.0
 
         if prev_time is not None and now > prev_time:
-            dt = now - prev_time
-            instant_fps = 1.0 / dt
+            instant_fps = 1.0 / (now - prev_time)
             fps = instant_fps if fps is None else lerp(fps, instant_fps, 0.2)
 
         prev_time = now
@@ -496,257 +532,40 @@ try:
         # Read-only input lets MediaPipe skip a copy.
         rgb.flags.writeable = False
 
-        hand_future = tracker_pool.submit(hands.process, rgb)
-        face_results = face_mesh.process(rgb)
-        hand_results = hand_future.result()
+        hand_results = hands.process(rgb)
 
-        # Face tracking.
+        # Portal tracking.
 
-        face_points = None
-        face_box = None
+        corners = get_portal_corners(hand_results, width, height)
 
-        if face_results.multi_face_landmarks:
+        if corners is not None:
 
-            face_points, face_box = get_face_data(
-                face_results.multi_face_landmarks[0],
-                width,
-                height
-            )
+            if portal_seen_at is None or now - portal_seen_at > REFRAME_GAP:
 
-            face_box = tuple(
-                int(v) for v in face_filter(face_box, now)
-            )
+                # A new framing: start smoothing fresh, and move on
+                # to the next filter (except for the very first one).
+                corner_filter.reset()
 
-        else:
+                if portal_seen_at is not None:
+                    filtro_index = (filtro_index + 1) % len(FILTROS)
 
-            # Start fresh when the face comes back, instead of
-            # gliding over from where it was lost.
-            face_filter.reset()
+            portal = corner_filter(corners, now)
+            portal_seen_at = now
 
-        # Hand tracking.
+        elif portal_seen_at is None or now - portal_seen_at > HOLD_TIME:
+            portal = None
 
-        fingertips = []
-        pinch_ratios = []
+        filtro = FILTROS[filtro_index]
 
-        if hand_results.multi_hand_landmarks:
-
-            for hand in hand_results.multi_hand_landmarks:
-
-                index = hand.landmark[8]
-                thumb = hand.landmark[4]
-
-                wrist = hand.landmark[0]
-                middle = hand.landmark[9]
-
-                ip = (
-                    int(index.x * width),
-                    int(index.y * height)
-                )
-
-                tp = (
-                    int(thumb.x * width),
-                    int(thumb.y * height)
-                )
-
-                wp = (
-                    int(wrist.x * width),
-                    int(wrist.y * height)
-                )
-
-                mpnt = (
-                    int(middle.x * width),
-                    int(middle.y * height)
-                )
-
-                fingertips.append(ip)
-
-                hand_size = max(
-                    distance(wp, mpnt),
-                    1
-                )
-
-                pinch_ratios.append(distance(ip, tp) / hand_size)
-
-        if not pinch_ratios:
-            pinch = False
-        elif pinch:
-            pinch = min(pinch_ratios) < PINCH_OFF
-        else:
-            pinch = min(pinch_ratios) < PINCH_ON
-
-        # HUD controls.
-
-        if face_box:
-
-            fx1, fy1, fx2, fy2 = face_box
-
-            target_cx = (fx1 + fx2) // 2
-            target_cy = (fy1 + fy2) // 2
-
-            target_scale = 1.0
-
-        else:
-
-            target_cx = width // 2
-            target_cy = height // 2
-            target_scale = 1.0
-
-        target_angle = 0.0
-
-        if len(fingertips) >= 2:
-
-            p1, p2 = fingertips[:2]
-
-            target_cx = (p1[0] + p2[0]) // 2
-            target_cy = (p1[1] + p2[1]) // 2
-
-            finger_distance = distance(
-                p1,
-                p2
-            )
-
-            target_scale = float(
-                np.clip(
-                    finger_distance / 250.0,
-                    0.65,
-                    1.7
-                )
-            )
-
-            target_angle = math.degrees(
-                math.atan2(
-                    p2[1] - p1[1],
-                    p2[0] - p1[0]
-                )
-            )
-
-        elif len(fingertips) == 1:
-
-            target_cx, target_cy = fingertips[0]
-
-        # Smooth motion.
-
-        smooth_cx, smooth_cy, smooth_scale = hud_filter(
-            (target_cx, target_cy, target_scale),
-            now
-        )
-
-        # Time-based, so the turn speed does not depend on frame rate.
-        smooth_angle = lerp_angle(
-            smooth_angle,
-            target_angle,
-            1.0 - math.exp(-7.0 * dt)
-        )
-
-        angle = smooth_angle
-
-        # Digital face effect.
-
-        if face_points is not None and face_box is not None:
-
-            if pinch:
-                frame = create_face_effect(
-                    frame,
-                    face_points,
-                    face_box
-                )
-
-                x1, y1, x2, y2 = face_box
-                cx_face = (x1 + x2) // 2
-                cy_face = (y1 + y2) // 2
-
-                glitch_w = int((x2 - x1) * 1.56)
-                glitch_h = int((y2 - y1) * 1.82)
-
-                scan_pts = quad_points(
-                    cx_face,
-                    cy_face,
-                    glitch_w,
-                    glitch_h,
-                    angle
-                )
-
-                glow_polygon(frame, scan_pts, 1)
-            else:
-                # The HUD follows the face by default.
-                hud_box = face_box
-
-                # If hands are controlling it, move the HUD center.
-                # draw_face_hud adds the margin, so only scale the face size here.
-                if fingertips:
-
-                    x1, y1, x2, y2 = face_box
-
-                    new_cx = int(smooth_cx)
-                    new_cy = int(smooth_cy)
-
-                    hud_w = int((x2 - x1) * smooth_scale)
-                    hud_h = int((y2 - y1) * smooth_scale)
-
-                    hud_box = (
-                        new_cx - hud_w // 2,
-                        new_cy - hud_h // 2,
-                        new_cx + hud_w // 2,
-                        new_cy + hud_h // 2
-                    )
-
-                draw_face_hud(
-                    frame,
-                    hud_box,
-                    angle
-                )
-
-        # Hand markers.
-
-        for p in fingertips:
-
-            cv2.circle(
-                frame,
-                p,
-                8,
-                (240, 240, 240),
-                1,
-                cv2.LINE_AA
-            )
-
-            cv2.circle(
-                frame,
-                p,
-                2,
-                (255, 255, 255),
-                -1,
-                cv2.LINE_AA
-            )
-
-        # Status.
-
-        if pinch:
-            status = "GLITCH // ACTIVE"
-        elif len(fingertips) >= 2:
-            status = "TWO HAND"
-        elif len(fingertips) == 1:
-            status = "HAND"
-        elif face_box:
-            status = "FACE LOCK"
-        else:
-            status = "SEARCH"
-
-        cv2.putText(
-            frame,
-            status,
-            (16, 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.46,
-            (235, 235, 235),
-            1,
-            cv2.LINE_AA
-        )
+        if portal is not None:
+            p1, p2, p3, p4 = order_corners(portal)
+            frame = render_portal(frame, p1, p2, p3, p4, filtro)
 
         # Recording.
 
         if writer is not None:
 
-            # Write before drawing the REC marker so it stays out of the video.
+            # Write before drawing labels so the video stays clean.
             writer.write(frame)
 
             cv2.circle(
@@ -757,16 +576,16 @@ try:
                 -1
             )
 
-            cv2.putText(
-                frame,
-                "REC",
-                (width - 65, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (235, 235, 235),
-                1,
-                cv2.LINE_AA
-            )
+            draw_label(frame, "REC", (width - 65, 30), 0.45)
+
+        # Status.
+
+        status = f"{filtro_index + 1}/{len(FILTROS)}  {filter_name(filtro)}"
+
+        if portal is None:
+            status = "FRAME WITH BOTH HANDS  //  NEXT: " + filter_name(filtro)
+
+        draw_label(frame, status, (16, 28))
 
         # Display.
 
@@ -776,6 +595,11 @@ try:
         )
 
         key = cv2.waitKey(1) & 0xFF
+
+        # Next filter.
+
+        if key in (ord("n"), ord("N"), ord(" ")):
+            filtro_index = (filtro_index + 1) % len(FILTROS)
 
         # Toggle recording.
 
@@ -787,7 +611,7 @@ try:
 
                 filename = os.path.join(
                     RECORDINGS_DIR,
-                    "spider_effect_"
+                    "portal_"
                     + time.strftime("%Y%m%d_%H%M%S")
                     + ".mp4"
                 )
@@ -836,10 +660,11 @@ finally:
         writer.release()
 
     camera.release()
-    tracker_pool.shutdown()
 
     hands.close()
-    face_mesh.close()
+
+    if segmenter is not None:
+        segmenter.close()
 
     cv2.destroyAllWindows()
 
