@@ -83,6 +83,57 @@ class CameraStream:
         self.cap.release()
 
 
+class OneEuroFilter:
+    """Adaptive smoothing for noisy tracking data (Casiez et al., 2012).
+
+    Smooths heavily while the input is still, which removes jitter, and
+    lightly while it moves fast, which removes lag. Works on scalars or
+    numpy arrays, and uses real time steps so it behaves the same at any
+    frame rate.
+    """
+
+    def __init__(self, min_cutoff=1.0, beta=0.01, d_cutoff=1.0):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.reset()
+
+    def reset(self):
+        self.x_prev = None
+        self.dx_prev = 0.0
+        self.t_prev = None
+
+    @staticmethod
+    def _alpha(dt, cutoff):
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def __call__(self, x, t):
+        x = np.asarray(x, dtype=np.float64)
+
+        if self.x_prev is None or self.t_prev is None:
+            self.x_prev = x
+            self.t_prev = t
+            return x
+
+        dt = t - self.t_prev
+
+        if dt <= 0:
+            return self.x_prev
+
+        dx = (x - self.x_prev) / dt
+        dx_hat = lerp(self.dx_prev, dx, self._alpha(dt, self.d_cutoff))
+
+        cutoff = self.min_cutoff + self.beta * np.abs(dx_hat)
+        x_hat = lerp(self.x_prev, x, self._alpha(dt, cutoff))
+
+        self.x_prev = x_hat
+        self.dx_prev = dx_hat
+        self.t_prev = t
+
+        return x_hat
+
+
 cap = cv2.VideoCapture(0)
 
 if not cap.isOpened():
@@ -94,9 +145,16 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 camera = CameraStream(cap)
 last_frame = 0
 
-smooth_cx = smooth_cy = None
-smooth_scale = 1.0
+# Smoothing for the face box and for the HUD's (center x, center y, scale).
+face_filter = OneEuroFilter(min_cutoff=0.5, beta=0.01)
+hud_filter = OneEuroFilter(min_cutoff=0.5, beta=0.01)
 smooth_angle = 0.0
+
+# Pinch turns on below the lower ratio and only turns off above the
+# higher one, so it does not flicker near the threshold.
+PINCH_ON = 0.45
+PINCH_OFF = 0.65
+pinch = False
 
 # Set while recording, None otherwise.
 writer = None
@@ -408,9 +466,11 @@ try:
             break
 
         now = time.perf_counter()
+        dt = 0.0
 
         if prev_time is not None and now > prev_time:
-            instant_fps = 1.0 / (now - prev_time)
+            dt = now - prev_time
+            instant_fps = 1.0 / dt
             fps = instant_fps if fps is None else lerp(fps, instant_fps, 0.2)
 
         prev_time = now
@@ -453,10 +513,20 @@ try:
                 height
             )
 
+            face_box = tuple(
+                int(v) for v in face_filter(face_box, now)
+            )
+
+        else:
+
+            # Start fresh when the face comes back, instead of
+            # gliding over from where it was lost.
+            face_filter.reset()
+
         # Hand tracking.
 
         fingertips = []
-        pinch = False
+        pinch_ratios = []
 
         if hand_results.multi_hand_landmarks:
 
@@ -495,8 +565,14 @@ try:
                     1
                 )
 
-                if distance(ip, tp) < hand_size * 0.55:
-                    pinch = True
+                pinch_ratios.append(distance(ip, tp) / hand_size)
+
+        if not pinch_ratios:
+            pinch = False
+        elif pinch:
+            pinch = min(pinch_ratios) < PINCH_OFF
+        else:
+            pinch = min(pinch_ratios) < PINCH_ON
 
         # HUD controls.
 
@@ -550,33 +626,16 @@ try:
 
         # Smooth motion.
 
-        if smooth_cx is None:
-
-            smooth_cx = target_cx
-            smooth_cy = target_cy
-
-        smooth_cx = lerp(
-            smooth_cx,
-            target_cx,
-            0.16
+        smooth_cx, smooth_cy, smooth_scale = hud_filter(
+            (target_cx, target_cy, target_scale),
+            now
         )
 
-        smooth_cy = lerp(
-            smooth_cy,
-            target_cy,
-            0.16
-        )
-
-        smooth_scale = lerp(
-            smooth_scale,
-            target_scale,
-            0.12
-        )
-
+        # Time-based, so the turn speed does not depend on frame rate.
         smooth_angle = lerp_angle(
             smooth_angle,
             target_angle,
-            0.2
+            1.0 - math.exp(-7.0 * dt)
         )
 
         angle = smooth_angle
