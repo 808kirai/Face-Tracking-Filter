@@ -15,7 +15,7 @@ Every time you drop your hands and frame again, the portal shows the next filter
 
 The filters cycle in this order:
 
-1. **Pink halftone**: pink and magenta duotone dots
+1. **Blue halftone**: light blue and deep blue duotone dots
 2. **Wireframe grid**: see-through white grid lines
 3. **Pop art**: orange background, magenta subject (uses MediaPipe selfie segmentation to find the person)
 4. **Newspaper**: black and white dot halftone

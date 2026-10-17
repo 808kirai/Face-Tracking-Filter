@@ -295,8 +295,8 @@ def halftone(image, cell, paper, ink):
     return np.ascontiguousarray(out[:h, :w])
 
 
-def pink_halftone(image):
-    return halftone(image, 8, paper=(215, 185, 255), ink=(125, 10, 205))
+def blue_halftone(image):
+    return halftone(image, 8, paper=(255, 220, 180), ink=(200, 70, 10))
 
 
 def wireframe_grid(image):
@@ -415,7 +415,7 @@ def frosted_glass(image):
 
 
 FILTROS = [
-    pink_halftone,
+    blue_halftone,
     wireframe_grid,
     pop_art,
     newspaper,
