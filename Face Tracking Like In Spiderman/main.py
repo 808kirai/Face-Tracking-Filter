@@ -33,12 +33,19 @@ if not cap.isOpened():
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 720)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
+WINDOW_NAME = "Spider Live Effect"
+RECORDINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
+
 smooth_cx = smooth_cy = None
 smooth_scale = 1.0
-phase = 0.0
+smooth_angle = 0.0
 
-recording = False
+# Set while recording, None otherwise.
 writer = None
+
+# Measured loop rate, so recordings play back at real speed.
+fps = None
+prev_time = None
 
 
 # Helpers.
@@ -49,6 +56,13 @@ def distance(a, b):
 
 def lerp(a, b, amount):
     return a + (b - a) * amount
+
+
+def lerp_angle(a, b, amount):
+    # The HUD is a rectangle, so angles 180 degrees apart look the same.
+    # Taking the shortest turn stops it spinning when the hands swap order.
+    diff = (b - a + 90) % 180 - 90
+    return a + diff * amount
 
 
 def rotate_point(cx, cy, x, y, angle):
@@ -160,10 +174,7 @@ def create_face_effect(frame, face_points, box, strong):
     if not strong:
         return frame
 
-    # Darken and sharpen the face area.
-
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
+    # Darken the face area.
 
     base = crop.copy()
 
@@ -272,7 +283,7 @@ def create_face_effect(frame, face_points, box, strong):
     return frame
 
 
-def draw_face_hud(frame, box, angle=0):
+def draw_face_hud(frame, box, angle=0.0):
     x1, y1, x2, y2 = box
 
     cx = (x1 + x2) // 2
@@ -328,376 +339,394 @@ print("2 HANDS -> resize + rotate HUD")
 print("PINCH   -> digital face mode")
 print()
 print("R = record")
-print("Q = quit")
+print("Q / ESC = quit")
 print()
 
 
 # Main loop.
 
-while True:
+try:
+    while True:
 
-    ok, frame = cap.read()
+        ok, frame = cap.read()
 
-    if not ok:
-        break
+        if not ok:
+            print("Camera stopped sending frames.")
+            break
 
-    frame = cv2.flip(frame, 1)
+        now = time.perf_counter()
 
-    original = frame.copy()
+        if prev_time is not None and now > prev_time:
+            instant_fps = 1.0 / (now - prev_time)
+            fps = instant_fps if fps is None else lerp(fps, instant_fps, 0.2)
 
-    height, width = frame.shape[:2]
+        prev_time = now
 
-    phase += 0.075
+        frame = cv2.flip(frame, 1)
 
-    rgb = cv2.cvtColor(
-        frame,
-        cv2.COLOR_BGR2RGB
-    )
+        height, width = frame.shape[:2]
 
-    face_results = face_mesh.process(rgb)
-    hand_results = hands.process(rgb)
-
-    # Face tracking.
-
-    face_points = None
-    face_box = None
-
-    if face_results.multi_face_landmarks:
-
-        face_points, face_box = get_face_data(
-            face_results.multi_face_landmarks[0],
-            width,
-            height
+        rgb = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2RGB
         )
 
-    # Hand tracking.
+        # Read-only input lets MediaPipe skip a copy.
+        rgb.flags.writeable = False
 
-    fingertips = []
-    pinch = False
+        face_results = face_mesh.process(rgb)
+        hand_results = hands.process(rgb)
 
-    if hand_results.multi_hand_landmarks:
+        # Face tracking.
 
-        for hand in hand_results.multi_hand_landmarks:
+        face_points = None
+        face_box = None
 
-            index = hand.landmark[8]
-            thumb = hand.landmark[4]
+        if face_results.multi_face_landmarks:
 
-            wrist = hand.landmark[0]
-            middle = hand.landmark[9]
-
-            ip = (
-                int(index.x * width),
-                int(index.y * height)
+            face_points, face_box = get_face_data(
+                face_results.multi_face_landmarks[0],
+                width,
+                height
             )
 
-            tp = (
-                int(thumb.x * width),
-                int(thumb.y * height)
-            )
+        # Hand tracking.
 
-            wp = (
-                int(wrist.x * width),
-                int(wrist.y * height)
-            )
+        fingertips = []
+        pinch = False
 
-            mpnt = (
-                int(middle.x * width),
-                int(middle.y * height)
-            )
+        if hand_results.multi_hand_landmarks:
 
-            fingertips.append(ip)
+            for hand in hand_results.multi_hand_landmarks:
 
-            hand_size = max(
-                distance(wp, mpnt),
-                1
-            )
+                index = hand.landmark[8]
+                thumb = hand.landmark[4]
 
-            if distance(ip, tp) < hand_size * 0.55:
-                pinch = True
+                wrist = hand.landmark[0]
+                middle = hand.landmark[9]
 
-    # HUD controls.
+                ip = (
+                    int(index.x * width),
+                    int(index.y * height)
+                )
 
-    if face_box:
+                tp = (
+                    int(thumb.x * width),
+                    int(thumb.y * height)
+                )
 
-        fx1, fy1, fx2, fy2 = face_box
+                wp = (
+                    int(wrist.x * width),
+                    int(wrist.y * height)
+                )
 
-        target_cx = (fx1 + fx2) // 2
-        target_cy = (fy1 + fy2) // 2
+                mpnt = (
+                    int(middle.x * width),
+                    int(middle.y * height)
+                )
 
-        target_scale = 1.0
+                fingertips.append(ip)
 
-    else:
-
-        target_cx = width // 2
-        target_cy = height // 2
-        target_scale = 1.0
-
-    angle = 0
-
-    if len(fingertips) >= 2:
-
-        p1, p2 = fingertips[:2]
-
-        target_cx = (p1[0] + p2[0]) // 2
-        target_cy = (p1[1] + p2[1]) // 2
-
-        finger_distance = distance(
-            p1,
-            p2
-        )
-
-        target_scale = float(
-            np.clip(
-                finger_distance / 250.0,
-                0.65,
-                1.7
-            )
-        )
-
-        angle = math.degrees(
-            math.atan2(
-                p2[1] - p1[1],
-                p2[0] - p1[0]
-            )
-        )
-
-    elif len(fingertips) == 1:
-
-        target_cx, target_cy = fingertips[0]
-
-    # Smooth motion.
-
-    if smooth_cx is None:
-
-        smooth_cx = target_cx
-        smooth_cy = target_cy
-
-    smooth_cx = lerp(
-        smooth_cx,
-        target_cx,
-        0.16
-    )
-
-    smooth_cy = lerp(
-        smooth_cy,
-        target_cy,
-        0.16
-    )
-
-    smooth_scale = lerp(
-        smooth_scale,
-        target_scale,
-        0.12
-    )
-
-    # Digital face effect.
-
-    if face_points is not None and face_box is not None:
-
-        if pinch:
-
-            frame = create_face_effect(
-                frame,
-                face_points,
-                face_box,
-                True
-            )
-
-        else:
-
-            frame = create_face_effect(
-                frame,
-                face_points,
-                face_box,
-                False
-            )
-
-        # The HUD follows the face by default.
-        hud_box = face_box
-
-        # If hands are controlling it, move the HUD center.
-        if fingertips:
-
-            x1, y1, x2, y2 = face_box
-
-            fw = x2 - x1
-            fh = y2 - y1
-
-            new_cx = int(smooth_cx)
-            new_cy = int(smooth_cy)
-
-            hud_w = int(fw * 1.65 * smooth_scale)
-            hud_h = int(fh * 1.75 * smooth_scale)
-
-            hud_box = (
-                new_cx - hud_w // 2,
-                new_cy - hud_h // 2,
-                new_cx + hud_w // 2,
-                new_cy + hud_h // 2
-            )
-
-        if pinch and face_box:
-            x1, y1, x2, y2 = face_box
-            cx_face = (x1 + x2) // 2
-            cy_face = (y1 + y2) // 2
-
-            glitch_w = int((x2 - x1) * 1.56)
-            glitch_h = int((y2 - y1) * 1.82)
-
-            scan_pts = quad_points(
-                cx_face,
-                cy_face,
-                glitch_w,
-                glitch_h,
-                angle
-            )
-
-            for i in range(4):
-                glow_line(
-                    frame,
-                    tuple(scan_pts[i]),
-                    tuple(scan_pts[(i + 1) % 4]),
+                hand_size = max(
+                    distance(wp, mpnt),
                     1
                 )
+
+                if distance(ip, tp) < hand_size * 0.55:
+                    pinch = True
+
+        # HUD controls.
+
+        if face_box:
+
+            fx1, fy1, fx2, fy2 = face_box
+
+            target_cx = (fx1 + fx2) // 2
+            target_cy = (fy1 + fy2) // 2
+
+            target_scale = 1.0
+
         else:
-            draw_face_hud(
-                frame,
-                hud_box,
-                angle
+
+            target_cx = width // 2
+            target_cy = height // 2
+            target_scale = 1.0
+
+        target_angle = 0.0
+
+        if len(fingertips) >= 2:
+
+            p1, p2 = fingertips[:2]
+
+            target_cx = (p1[0] + p2[0]) // 2
+            target_cy = (p1[1] + p2[1]) // 2
+
+            finger_distance = distance(
+                p1,
+                p2
             )
 
-    # Hand markers.
+            target_scale = float(
+                np.clip(
+                    finger_distance / 250.0,
+                    0.65,
+                    1.7
+                )
+            )
 
-    for p in fingertips:
+            target_angle = math.degrees(
+                math.atan2(
+                    p2[1] - p1[1],
+                    p2[0] - p1[0]
+                )
+            )
 
-        cv2.circle(
-            frame,
-            p,
-            8,
-            (240, 240, 240),
-            1,
-            cv2.LINE_AA
+        elif len(fingertips) == 1:
+
+            target_cx, target_cy = fingertips[0]
+
+        # Smooth motion.
+
+        if smooth_cx is None:
+
+            smooth_cx = target_cx
+            smooth_cy = target_cy
+
+        smooth_cx = lerp(
+            smooth_cx,
+            target_cx,
+            0.16
         )
 
-        cv2.circle(
-            frame,
-            p,
-            2,
-            (255, 255, 255),
-            -1,
-            cv2.LINE_AA
+        smooth_cy = lerp(
+            smooth_cy,
+            target_cy,
+            0.16
         )
 
-    # Status.
-
-    if pinch:
-        status = "GLITCH // ACTIVE"
-    elif len(fingertips) >= 2:
-        status = "TWO HAND"
-    elif len(fingertips) == 1:
-        status = "HAND"
-    elif face_box:
-        status = "FACE LOCK"
-    else:
-        status = "SEARCH"
-
-    cv2.putText(
-        frame,
-        status,
-        (16, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.46,
-        (235, 235, 235),
-        1,
-        cv2.LINE_AA
-    )
-
-    # Recording.
-
-    if recording:
-
-        cv2.circle(
-            frame,
-            (width - 25, 25),
-            7,
-            (255, 255, 255),
-            -1
+        smooth_scale = lerp(
+            smooth_scale,
+            target_scale,
+            0.12
         )
+
+        smooth_angle = lerp_angle(
+            smooth_angle,
+            target_angle,
+            0.2
+        )
+
+        angle = smooth_angle
+
+        # Digital face effect.
+
+        if face_points is not None and face_box is not None:
+
+            frame = create_face_effect(
+                frame,
+                face_points,
+                face_box,
+                pinch
+            )
+
+            # The HUD follows the face by default.
+            hud_box = face_box
+
+            # If hands are controlling it, move the HUD center.
+            if fingertips:
+
+                x1, y1, x2, y2 = face_box
+
+                fw = x2 - x1
+                fh = y2 - y1
+
+                new_cx = int(smooth_cx)
+                new_cy = int(smooth_cy)
+
+                hud_w = int(fw * 1.65 * smooth_scale)
+                hud_h = int(fh * 1.75 * smooth_scale)
+
+                hud_box = (
+                    new_cx - hud_w // 2,
+                    new_cy - hud_h // 2,
+                    new_cx + hud_w // 2,
+                    new_cy + hud_h // 2
+                )
+
+            if pinch:
+                x1, y1, x2, y2 = face_box
+                cx_face = (x1 + x2) // 2
+                cy_face = (y1 + y2) // 2
+
+                glitch_w = int((x2 - x1) * 1.56)
+                glitch_h = int((y2 - y1) * 1.82)
+
+                scan_pts = quad_points(
+                    cx_face,
+                    cy_face,
+                    glitch_w,
+                    glitch_h,
+                    angle
+                )
+
+                for i in range(4):
+                    glow_line(
+                        frame,
+                        tuple(scan_pts[i]),
+                        tuple(scan_pts[(i + 1) % 4]),
+                        1
+                    )
+            else:
+                draw_face_hud(
+                    frame,
+                    hud_box,
+                    angle
+                )
+
+        # Hand markers.
+
+        for p in fingertips:
+
+            cv2.circle(
+                frame,
+                p,
+                8,
+                (240, 240, 240),
+                1,
+                cv2.LINE_AA
+            )
+
+            cv2.circle(
+                frame,
+                p,
+                2,
+                (255, 255, 255),
+                -1,
+                cv2.LINE_AA
+            )
+
+        # Status.
+
+        if pinch:
+            status = "GLITCH // ACTIVE"
+        elif len(fingertips) >= 2:
+            status = "TWO HAND"
+        elif len(fingertips) == 1:
+            status = "HAND"
+        elif face_box:
+            status = "FACE LOCK"
+        else:
+            status = "SEARCH"
 
         cv2.putText(
             frame,
-            "REC",
-            (width - 65, 30),
+            status,
+            (16, 28),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
+            0.46,
             (235, 235, 235),
             1,
             cv2.LINE_AA
         )
 
-        writer.write(frame)
+        # Recording.
 
-    # Display.
+        if writer is not None:
 
-    cv2.imshow(
-        "Spider Live Effect",
-        frame
-    )
+            # Write before drawing the REC marker so it stays out of the video.
+            writer.write(frame)
 
-    key = cv2.waitKey(1) & 0xFF
-
-    # Toggle recording.
-
-    if key == ord("r"):
-
-        recording = not recording
-
-        if recording:
-
-            filename = (
-                "spider_effect_"
-                + time.strftime("%Y%m%d_%H%M%S")
-                + ".mp4"
+            cv2.circle(
+                frame,
+                (width - 25, 25),
+                7,
+                (255, 255, 255),
+                -1
             )
 
-            fourcc = cv2.VideoWriter_fourcc(
-                *"mp4v"
+            cv2.putText(
+                frame,
+                "REC",
+                (width - 65, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (235, 235, 235),
+                1,
+                cv2.LINE_AA
             )
 
-            writer = cv2.VideoWriter(
-                filename,
-                fourcc,
-                30,
-                (width, height)
-            )
+        # Display.
 
-            print("Recording:", filename)
+        cv2.imshow(
+            WINDOW_NAME,
+            frame
+        )
 
-        else:
+        key = cv2.waitKey(1) & 0xFF
 
-            if writer is not None:
+        # Toggle recording.
+
+        if key in (ord("r"), ord("R")):
+
+            if writer is None:
+
+                os.makedirs(RECORDINGS_DIR, exist_ok=True)
+
+                filename = os.path.join(
+                    RECORDINGS_DIR,
+                    "spider_effect_"
+                    + time.strftime("%Y%m%d_%H%M%S")
+                    + ".mp4"
+                )
+
+                fourcc = cv2.VideoWriter_fourcc(
+                    *"mp4v"
+                )
+
+                record_fps = float(np.clip(round(fps or 30), 5, 60))
+
+                writer = cv2.VideoWriter(
+                    filename,
+                    fourcc,
+                    record_fps,
+                    (width, height)
+                )
+
+                if writer.isOpened():
+                    print(f"Recording at {record_fps:.0f} fps:", filename)
+                else:
+                    writer.release()
+                    writer = None
+                    print("Could not start recording:", filename)
+
+            else:
 
                 writer.release()
                 writer = None
 
-            print("Recording stopped.")
+                print("Recording stopped.")
 
-    # Quit.
+        # Quit with Q, ESC, or the window close button.
 
-    if key == ord("q"):
-        break
+        if key in (ord("q"), ord("Q"), 27):
+            break
 
+        if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+            break
 
-# Cleanup.
+finally:
 
-if writer is not None:
-    writer.release()
+    # Cleanup, even after a crash, so the camera is freed
+    # and any recording is saved properly.
 
-cap.release()
+    if writer is not None:
+        writer.release()
 
-hands.close()
-face_mesh.close()
+    cap.release()
 
-cv2.destroyAllWindows()
+    hands.close()
+    face_mesh.close()
 
-print("Finished.")
+    cv2.destroyAllWindows()
+
+    print("Finished.")

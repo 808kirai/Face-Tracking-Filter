@@ -127,7 +127,7 @@ Make sure the webcam is connected and that the operating system has granted the 
 - Keyboard controls
 
 `R` to Start or stop video recording 
-`Q` to Exit the application 
+`Q` or `Esc` to Exit the application (closing the window also works)
 
 - Hand gestures
 
@@ -140,6 +140,8 @@ Make sure the webcam is connected and that the operating system has granted the 
 Press `R` while the application is running to start recording the processed webcam feed.
 
 Press `R` again to stop recording.
+
+Videos are saved as `.mp4` files in the `recordings/` folder next to `main.py`. The frame rate matches the speed the app is actually running at, so playback looks like real time.
 
 The resulting video can be used for demonstrations, testing, or sharing.
 
