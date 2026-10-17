@@ -4,7 +4,7 @@ Real-time computer vision experiments built with Python.
 
 ## Projects
 
-- [Face Tracking Like In Spiderman](Face%20Tracking%20Like%20In%20Spiderman/) - a webcam HUD inspired by Spider-Man's AR interfaces. MediaPipe tracks the face and hands; OpenCV renders the HUD and a pinch-triggered glitch effect live.
+- [Face Tracking Like In Spiderman](Face%20Tracking%20Like%20In%20Spiderman/) - a hand portal filter. Frame your face with both hands and the area inside your fingers is filtered live (halftone, pop art, thermal, and more), switching to the next filter each time you frame again.
 - [3d-interactive-model](3d-interactive-model/) - a small PyVista viewer that renders an interactive metallic 3D model.
 
 Each project has its own `requirements.txt`. Install and run them from inside their folder:

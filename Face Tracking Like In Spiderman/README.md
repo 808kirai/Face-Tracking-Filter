@@ -1,255 +1,118 @@
-- Spider-Man Inspired Real-Time Face Tracking HUD
+# Hand Portal Filter
 
-A real-time computer vision application built with Python, OpenCV, and MediaPipe that uses a webcam to track facial landmarks and hand gestures. The tracked movements control an interactive heads-up display inspired by Spider-Man-style augmented-reality interfaces.
+A real-time webcam effect built with Python, OpenCV, and MediaPipe. Frame your face with both hands, like a camera viewfinder, and the area inside your fingers becomes a portal with a filter applied. Everything outside the portal stays as the normal camera image.
 
-The project is an interactive computer vision experiment rather than a pre-rendered video effect. Face tracking, hand tracking, gesture recognition, graphical rendering, and visual effects are processed live from the webcam feed.
+Every time you drop your hands and frame again, the portal shows the next filter.
 
-- Overview
+## How it works
 
-This project combines facial landmark detection, hand tracking, gesture recognition, and real-time graphical rendering to create an interactive augmented-reality-style interface.
+- MediaPipe Hands tracks both hands. The **thumb tip and index fingertip of each hand** are the 4 corners of the portal.
+- The corners are smoothed so the portal doesn't jitter, then ordered by angle so the shape never crosses itself. The portal can be tilted, skewed, stretched, or shrunk just by moving your hands.
+- Only the inside of the portal is filtered, and it gets a thin glowing white outline.
+- With no hands, or only one, you see the plain camera feed.
 
-MediaPipe detects facial landmarks and hands from the webcam stream. OpenCV processes the camera frames, performs image manipulation, and renders the HUD elements and visual effects over the live video.
+## Filters
 
-- Features
+The filters cycle in this order:
 
-- Real-Time Face Tracking
+1. **Pink halftone**: pink and magenta duotone dots
+2. **Wireframe grid**: see-through white grid lines
+3. **Pop art**: orange background, magenta subject (uses MediaPipe selfie segmentation to find the person)
+4. **Newspaper**: black and white dot halftone
+5. **RGB split**: chromatic aberration glitch
+6. **Thermal**: jet colormap
+7. **Sepia**: warm, faded vintage tone
+8. **Frosted glass**: heavy blur with a white tint
 
-The application uses MediaPipe Face Mesh to detect facial landmarks from the webcam feed. Facial landmark data is used to locate the user's face, track facial features, position visual elements relative to the face, and trigger interactive facial effects.
+Each filter is a plain function `f(image) -> image` in the `FILTROS` list in `main.py`, so adding your own is a matter of writing a function and appending it.
 
-- Hand Tracking
+## Controls
 
-MediaPipe Hands detects hands and individual finger landmarks. Hand tracking provides the primary method of interacting with the HUD.
+### Hands
 
-Supported interactions include single-finger movement, two-finger scaling and rotation, and pinch-based interaction.
+| Gesture | Action |
+| --- | --- |
+| Both hands in a "camera frame" (thumbs and index fingers out) | Open the portal |
+| Drop your hands and frame again | Next filter |
 
-- Interactive HUD
+### Keyboard
 
-Graphical interface elements are rendered over the live webcam feed. These elements are dynamically positioned and transformed based on tracked facial and hand coordinates.
+| Key | Action |
+| --- | --- |
+| `N` or `Space` | Next filter |
+| `R` | Start or stop recording |
+| `Q`, `Esc`, or closing the window | Quit |
 
-- Gesture control
+## Requirements
 
-A single index finger can move the HUD element, two index fingers can resize and rotate it, and a pinch gesture can trigger the interactive facial effect.
+- Python 3.11 or 3.12
+- A webcam
 
-- Real-time rendering
-
-All visual effects are generated while the application is running. The project does not rely on a pre-recorded video. The webcam stream is processed frame-by-frame so the interface can respond immediately to user movement.
-
-- Video recording
-
-The application includes an optional recording mode for demonstrations, testing, and later viewing.
-
-- Technologies
-
-- Python 3.12
-- OpenCV
-- MediaPipe
-- NumPy
-
-OpenCV handles webcam capture, image processing, frame manipulation, graphical rendering, real-time display, and video recording.
-
-MediaPipe provides facial and hand landmark detection.
-
-NumPy handles numerical operations, coordinate calculations, transformations, and tracking data.
-
-- Requirements
-
-- Python 3.12 or compatible Python 3.x version
-- Working webcam
-- Git
-- Terminal or command prompt
-
-Python 3.12 is recommended for compatibility with the MediaPipe version used during development.
-
-- Installation
-
-Clone the repository:
+## Installation
 
 ```bash
 git clone https://github.com/808kirai/Face-Tracking-Filter.git
-```
-
-Navigate into the project directory:
-
-```bash
 cd Face-Tracking-Filter/"Face Tracking Like In Spiderman"
-```
-
-Create a virtual environment:
-
-```bash
 python -m venv .venv
 ```
 
-Activate it on Windows PowerShell:
+Activate the virtual environment:
 
 ```powershell
-.venv\Scripts\Activate.ps1
+.venv\Scripts\Activate.ps1          # Windows PowerShell
 ```
-
-On Windows Command Prompt:
 
 ```cmd
-.venv\Scripts\activate
+.venv\Scripts\activate              # Windows Command Prompt
 ```
-
-On macOS or Linux:
 
 ```bash
-source .venv/bin/activate
+source .venv/bin/activate           # macOS or Linux
 ```
 
-Install dependencies:
+Install the dependencies and run it:
 
 ```bash
 pip install -r requirements.txt
-```
-
-If `requirements.txt` is unavailable:
-
-```bash
-pip install mediapipe==0.10.21 opencv-python==4.11.0.86 numpy==1.26.4
-```
-
-- Running the Application
-
-Start the application with:
-
-```bash
 python main.py
 ```
 
-The application will open the webcam and begin processing the video stream in real time.
+## Recording
 
-Make sure the webcam is connected and that the operating system has granted the application camera access.
+Press `R` to start recording and `R` again to stop. Videos are saved as `.mp4` files in the `recordings/` folder next to `main.py`.
 
-- Controls
+The frame rate matches the speed the app is actually running at, so playback looks like real time. On-screen labels are left out of the recording.
 
-- Keyboard controls
+## Performance
 
-`R` to Start or stop video recording 
-`Q` or `Esc` to Exit the application (closing the window also works)
+- Hand tracking runs on a copy of the frame scaled down to 640px wide, and the camera is read on a background thread.
+- Only the portal's bounding box is filtered, not the whole frame.
+- Most filters take 2 to 4 ms even on a large portal. Pop art is the heaviest, at around 18 ms, because it runs a segmentation model. That model only loads the first time pop art is shown.
 
-- Hand gestures
+Good, even lighting makes hand tracking much more reliable.
 
- One index finger to Move the HUD element 
- Two index fingers to Resize and rotate the HUD element 
- Pinch to  Activate the interactive facial effect 
+## Troubleshooting
 
-- Recording
+### Camera not opening
 
-Press `R` while the application is running to start recording the processed webcam feed.
-
-Press `R` again to stop recording.
-
-Videos are saved as `.mp4` files in the `recordings/` folder next to `main.py`. The frame rate matches the speed the app is actually running at, so playback looks like real time.
-
-The resulting video can be used for demonstrations, testing, or sharing.
-
-- Project Structure
-
-```text
-Face Tracking Like In Spiderman/
-│
-├── main.py
-├── requirements.txt
-├── README.md
-├── .gitignore
-└── .venv/
-```
-
-The `.venv` directory should not be committed to GitHub because it contains locally installed packages and environment-specific files.
-
-The `.gitignore` file should contain:
-
-```text
-.venv/
-__pycache__/
-*.pyc
-```
-
-- Performance
-
-Real-time computer vision can require significant processing power. Performance depends on the computer's CPU, webcam resolution, camera frame rate, lighting conditions, and other applications running simultaneously.
-
-For better performance:
-
-- Use a reasonable webcam resolution.
-- Close unnecessary applications.
-- Use the recommended Python and MediaPipe versions.
-- Ensure the face and hands are clearly visible.
-- Use adequate lighting.
-
-Good lighting can significantly improve face and hand landmark detection.
-
-- Troubleshooting
-
-- Camera not opening
-
-Check that the webcam is connected and available to other applications.
-
-If multiple cameras are connected, the camera index in `main.py` may need to be changed.
-
-For example:
+Check that the webcam is connected and not in use by another app, and that your OS allows camera access. If you have more than one camera, change the index in `main.py`:
 
 ```python
-cv2.VideoCapture(0)
+cap = cv2.VideoCapture(1)
 ```
 
-can be changed to:
+### The portal flickers or does not appear
 
-```python
-cv2.VideoCapture(1)
-```
+Both hands need to be fully visible, with the thumb and index finger clearly separated. Avoid backlighting and keep your hands within the frame.
 
-depending on the camera configuration.
+### MediaPipe import error
 
-- MediaPipe import error
+The project is tested with `mediapipe==0.10.21`. Check the installed version with `pip show mediapipe`.
 
-Check the installed MediaPipe version:
+## Disclaimer
 
-```bash
-pip show mediapipe
-```
+This is an independent computer vision experiment. It is not affiliated with, endorsed by, or associated with Marvel, Sony, or any Spider-Man production.
 
-The project was developed and tested using:
+## License
 
-```text
-mediapipe==0.10.21
-```
-
-- Poor face or hand detection
-
-Improve the lighting and make sure the face and hands are clearly visible to the camera.
-
-Avoid extreme camera angles and excessive motion when testing the tracking system.
-
-- Development
-
-The project is structured so additional visual effects, HUD components, and gesture interactions can be added over time.
-
-Potential future improvements include:
-
-- Additional HUD components
-- More gesture-controlled interactions
-- Improved facial effects
-- Custom animations
-- Additional interface themes
-- Improved tracking stability
-- Multiple simultaneously tracked objects
-- Additional camera and recording controls
-
-- Purpose
-
-This project was created as an exploration of real-time computer vision, gesture recognition, facial landmark tracking, and interactive graphical interfaces.
-
-It demonstrates how facial landmarks and hand tracking can be combined with traditional computer vision techniques to create an interactive augmented-reality-style experience using commonly available hardware and open-source technologies.
-
-- Disclaimer
-
-This project is an independent computer vision experiment inspired by the visual design language of Spider-Man-related augmented-reality interfaces.
-
-It is not affiliated with, endorsed by, or officially associated with Marvel, Sony, or any Spider-Man production.
-
-- License
-
-This project is provided for educational and experimental purposes. If you choose to distribute or modify the project, consider adding an appropriate open-source license such as the MIT License.
+Provided for educational and experimental use. If you plan to distribute it, consider adding an open-source license such as MIT.
