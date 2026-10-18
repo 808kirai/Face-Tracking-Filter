@@ -8,9 +8,9 @@ import math
 import threading
 import time
 
-# Live hand portal effect.
-# Thumbs and index fingers of both hands frame a portal, and only the
-# inside of the portal is filtered. Each new framing shows the next filter.
+# live hand portal effect
+# thumbs and index fingers of both hands frame a portal, and only the
+# inside of the portal is filtered, each new framing shows the next filter
 
 hands = mp.solutions.hands.Hands(
     max_num_hands=2,
@@ -18,32 +18,32 @@ hands = mp.solutions.hands.Hands(
     min_tracking_confidence=0.55
 )
 
-# Person segmentation for the pop art filter, created when first needed.
+# person segmentation for the pop art filter, created when first needed
 segmenter = None
 
-WINDOW_NAME = "Portal Filter"
-RECORDINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
+window_name = "Portal Filter"
+recordings_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
 
-# Tracking runs on a smaller copy of the frame. Landmarks come back
-# normalized, so they still map onto the full-size frame.
-MAX_TRACK_WIDTH = 640
+# tracking runs on a smaller copy of the frame, landmarks come back
+# normalized so they still map onto the full size frame
+max_track_width = 640
 
-# Hand landmark indices.
-WRIST = 0
-THUMB_TIP = 4
-INDEX_TIP = 8
+# hand landmark indices
+wrist = 0
+thumb_tip = 4
+index_tip = 8
 
-# A gap longer than this counts as taking the hands away and framing again,
-# which moves on to the next filter.
-REFRAME_GAP = 0.4
+# a gap longer than this counts as taking the hands away and framing again,
+# which moves on to the next filter
+reframe_gap = 0.4
 
-# Keep the last portal on screen through tracking dropouts this short.
-HOLD_TIME = 0.15
+# keep the last portal on screen through tracking dropouts this short
+hold_time = 0.15
 
 
-class CameraStream:
-    """Reads the camera on a background thread, so the main loop
-    always gets the newest frame instead of waiting for the camera."""
+class camera_stream:
+    # reads the camera on a background thread, so the main loop
+    # always gets the newest frame instead of waiting for the camera
 
     def __init__(self, cap):
         self.cap = cap
@@ -70,7 +70,7 @@ class CameraStream:
                 break
 
     def read(self, last_count):
-        # Wait for a frame newer than the one returned last time.
+        # wait for a frame newer than the one returned last time
         with self.cond:
             self.cond.wait_for(lambda: self.count != last_count, timeout=2.0)
 
@@ -85,14 +85,12 @@ class CameraStream:
         self.cap.release()
 
 
-class OneEuroFilter:
-    """Adaptive smoothing for noisy tracking data (Casiez et al., 2012).
-
-    Smooths heavily while the input is still, which removes jitter, and
-    lightly while it moves fast, which removes lag. Works on scalars or
-    numpy arrays, and uses real time steps so it behaves the same at any
-    frame rate.
-    """
+class one_euro_filter:
+    # adaptive smoothing for noisy tracking data, from Casiez et al 2012
+    # smooths heavily while the input is still, which removes jitter, and
+    # lightly while it moves fast, which removes lag
+    # works on scalars or numpy arrays, and uses real time steps so it
+    # behaves the same at any frame rate
 
     def __init__(self, min_cutoff=1.0, beta=0.01, d_cutoff=1.0):
         self.min_cutoff = min_cutoff
@@ -136,7 +134,9 @@ class OneEuroFilter:
         return x_hat
 
 
-cap = cv2.VideoCapture(0)
+# directshow on windows, the default media foundation backend can open
+# the camera but then fail to stream frames
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY)
 
 if not cap.isOpened():
     raise RuntimeError("Camera could not be opened.")
@@ -144,36 +144,37 @@ if not cap.isOpened():
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 720)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-camera = CameraStream(cap)
+camera = camera_stream(cap)
 last_frame = 0
 
-# Smooths the 4 fingertip corners (left thumb, left index, right thumb, right index).
-corner_filter = OneEuroFilter(min_cutoff=0.5, beta=0.01)
+# smooths the 4 fingertip corners in the order left thumb, left index,
+# right thumb, right index
+corner_filter = one_euro_filter(min_cutoff=0.5, beta=0.01)
 
-# Last portal corners and when they were seen.
+# last portal corners and when they were seen
 portal = None
 portal_seen_at = None
 
 filtro_index = 0
 
-# Set while recording, None otherwise.
+# set while recording, None otherwise
 writer = None
 
-# Measured loop rate, so recordings play back at real speed.
+# measured loop rate, so recordings play back at real speed
 fps = None
 prev_time = None
 
 
-# Helpers.
+# helpers
 
 def lerp(a, b, amount):
     return a + (b - a) * amount
 
 
 def glow_polygon(image, pts, thickness=1):
-    # Soft glow, no clutter.
-    # Only the area around the outline is blurred, in a single pass,
-    # so the rest of the frame stays sharp and cheap to draw.
+    # soft glow with no clutter
+    # only the area around the outline is blurred, in a single pass,
+    # so the rest of the frame stays sharp and cheap to draw
     h, w = image.shape[:2]
     pad = thickness * 3 + 8
 
@@ -199,7 +200,7 @@ def glow_polygon(image, pts, thickness=1):
 
     glow = cv2.GaussianBlur(glow, (0, 0), 2)
 
-    # Lighten towards white where the glow is, up to 12%.
+    # lighten towards white where the glow is, up to 12 percent
     lift = cv2.multiply(
         cv2.bitwise_not(roi),
         cv2.cvtColor(glow, cv2.COLOR_GRAY2BGR),
@@ -216,8 +217,8 @@ def glow_polygon(image, pts, thickness=1):
 
 
 def order_corners(pts):
-    # Sort by angle around the centroid so the corners always
-    # make a polygon that does not cross itself.
+    # sort by angle around the centroid so the corners always
+    # make a polygon that does not cross itself
     center = pts.mean(axis=0)
     angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
 
@@ -225,33 +226,33 @@ def order_corners(pts):
 
 
 def get_portal_corners(hand_results, width, height):
-    # The 4 fingertips of a two-hand "camera frame" gesture,
-    # or None unless exactly two hands are visible.
+    # the 4 fingertips of a two hand camera frame gesture,
+    # or None unless exactly two hands are visible
     landmarks = hand_results.multi_hand_landmarks
 
     if not landmarks or len(landmarks) != 2:
         return None
 
-    # Left hand on screen first, so each corner keeps its identity
-    # from frame to frame and can be smoothed.
-    ordered = sorted(landmarks, key=lambda hand: hand.landmark[WRIST].x)
+    # left hand on screen first, so each corner keeps its identity
+    # from frame to frame and can be smoothed
+    ordered = sorted(landmarks, key=lambda hand: hand.landmark[wrist].x)
 
     return np.array(
         [
             (hand.landmark[tip].x * width, hand.landmark[tip].y * height)
             for hand in ordered
-            for tip in (THUMB_TIP, INDEX_TIP)
+            for tip in (thumb_tip, index_tip)
         ],
         dtype=np.float64
     )
 
 
-# Filters.
-# Each takes a BGR image and returns a filtered BGR image of the same size.
+# filters
+# each takes a bgr image and returns a filtered bgr image of the same size
 
-HALFTONE_LEVELS = 24
+halftone_levels = 24
 
-# Pre-rendered dot tiles, one per dot size, keyed by (cell, paper, ink).
+# prerendered dot tiles, one per dot size, keyed by cell, paper and ink
 halftone_tiles = {}
 
 
@@ -259,13 +260,13 @@ def get_halftone_tiles(cell, paper, ink):
     key = (cell, paper, ink)
 
     if key not in halftone_tiles:
-        # Distance from each pixel to the center of the cell.
+        # distance from each pixel to the center of the cell
         d = np.arange(cell) - (cell - 1) / 2.0
         dist = np.sqrt(d[:, None] ** 2 + d[None, :] ** 2)
 
-        radius = np.linspace(0.0, cell * 0.72, HALFTONE_LEVELS)
+        radius = np.linspace(0.0, cell * 0.72, halftone_levels)
 
-        # Soft dot edges instead of jagged ones.
+        # soft dot edges instead of jagged ones
         coverage = np.clip(radius[:, None, None] - dist + 0.5, 0.0, 1.0)[..., None]
 
         paper_c = np.array(paper, dtype=np.float32)
@@ -281,14 +282,14 @@ def halftone(image, cell, paper, ink):
 
     gray = cv2.equalizeHist(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
 
-    # One dot per cell, bigger where the image is darker.
+    # one dot per cell, bigger where the image is darker
     cells_w = -(-w // cell)
     cells_h = -(-h // cell)
 
     small = cv2.resize(gray, (cells_w, cells_h), interpolation=cv2.INTER_AREA)
-    levels = ((255 - small.astype(np.int32)) * (HALFTONE_LEVELS - 1) + 127) // 255
+    levels = ((255 - small.astype(np.int32)) * (halftone_levels - 1) + 127) // 255
 
-    # Lay the matching dot tile into every cell, then trim to size.
+    # lay the matching dot tile into every cell, then trim to size
     tiles = get_halftone_tiles(cell, paper, ink)[levels]
     out = tiles.transpose(0, 2, 1, 3, 4).reshape(cells_h * cell, cells_w * cell, 3)
 
@@ -310,24 +311,24 @@ def wireframe_grid(image):
     return out
 
 
-# Colors for the pop art labels, as a lookup table.
-POP_ART_COLORS = np.zeros((256, 1, 3), dtype=np.uint8)
-POP_ART_COLORS[0] = (0, 140, 255)      # orange background
-POP_ART_COLORS[1] = (190, 30, 235)     # magenta subject
-POP_ART_COLORS[2] = (80, 0, 90)        # deep purple ink
+# colors for the pop art labels, as a lookup table
+pop_art_colors = np.zeros((256, 1, 3), dtype=np.uint8)
+pop_art_colors[0] = (0, 140, 255)      # orange background
+pop_art_colors[1] = (190, 30, 235)     # magenta subject
+pop_art_colors[2] = (80, 0, 90)        # deep purple ink
 
 
 def pop_art(image):
     global segmenter
 
-    # Created on first use, so the model only loads if this filter is shown.
+    # created on first use, so the model only loads if this filter is shown
     if segmenter is None:
         segmenter = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=1)
 
     h, w = image.shape[:2]
 
-    # The model works at 256px anyway, so hand it a small copy
-    # and scale the mask back up.
+    # the model works at 256px anyway, so hand it a small copy
+    # and scale the mask back up
     scale = min(1.0, 256 / max(h, w))
     small = cv2.resize(image, (max(1, round(w * scale)), max(1, round(h * scale))), interpolation=cv2.INTER_AREA)
 
@@ -337,14 +338,14 @@ def pop_art(image):
     mask = cv2.resize(segmenter.process(rgb).segmentation_mask, (w, h), interpolation=cv2.INTER_LINEAR)
     subject = mask > 0.5
 
-    # 0 = background, 1 = subject, 2 = ink.
+    # 0 is background, 1 is subject, 2 is ink
     label = subject.astype(np.uint8)
 
     if subject.any():
         gray = cv2.medianBlur(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), 5)
 
-        # Shadows from the subject's own brightness, plus local detail
-        # (eyes, mouth, outlines) that a single threshold would miss.
+        # shadows from the subject's own brightness, plus local detail
+        # like eyes, mouth and outlines that a single threshold would miss
         shadow = np.percentile(gray[subject], 25)
 
         block = max(11, (min(gray.shape) // 16) | 1)
@@ -357,7 +358,7 @@ def pop_art(image):
 
         label += subject & ((gray < shadow) | detail)
 
-    return cv2.LUT(cv2.merge((label, label, label)), POP_ART_COLORS)
+    return cv2.LUT(cv2.merge((label, label, label)), pop_art_colors)
 
 
 def newspaper(image):
@@ -375,7 +376,7 @@ def rgb_split(image):
         np.roll(r, shift, axis=1)
     ))
 
-    # Faint scan lines.
+    # faint scan lines
     out[::3] = (out[::3] * 0.8).astype(np.uint8)
 
     return out
@@ -387,8 +388,8 @@ def thermal(image):
     return cv2.applyColorMap(gray, cv2.COLORMAP_JET)
 
 
-# Sepia weights for BGR input. Rows are the output B, G, R channels.
-SEPIA = np.array([
+# sepia weights for bgr input, rows are the output b, g and r channels
+sepia_weights = np.array([
     [0.131, 0.534, 0.272],
     [0.168, 0.686, 0.349],
     [0.189, 0.769, 0.393]
@@ -396,25 +397,25 @@ SEPIA = np.array([
 
 
 def sepia(image):
-    toned = cv2.transform(image, SEPIA)
+    toned = cv2.transform(image, sepia_weights)
 
-    # Slightly faded, like an old print.
+    # slightly faded, like an old print
     return cv2.convertScaleAbs(toned, alpha=0.88, beta=18)
 
 
 def frosted_glass(image):
     h, w = image.shape[:2]
 
-    # Blurring a quarter-size copy is much cheaper than a huge kernel.
+    # blurring a quarter size copy is much cheaper than a huge kernel
     small = cv2.resize(image, (max(1, w // 4), max(1, h // 4)), interpolation=cv2.INTER_AREA)
     small = cv2.GaussianBlur(small, (0, 0), 3)
     blurred = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
 
-    # White tint.
+    # white tint
     return cv2.convertScaleAbs(blurred, alpha=0.7, beta=255 * 0.3)
 
 
-FILTROS = [
+filtros = [
     blue_halftone,
     wireframe_grid,
     pop_art,
@@ -431,12 +432,12 @@ def filter_name(filtro):
 
 
 def render_portal(frame, p1, p2, p3, p4, filtro):
-    """Applies filtro inside the quad p1-p4 and draws its outline."""
+    # applies filtro inside the quad p1 to p4 and draws its outline
 
     h, w = frame.shape[:2]
     pts = np.array([p1, p2, p3, p4], dtype=np.int32)
 
-    # Only filter the portal's bounding box, not the whole frame.
+    # only filter the portal's bounding box, not the whole frame
     x, y, bw, bh = cv2.boundingRect(pts)
 
     x1 = max(0, x)
@@ -450,7 +451,7 @@ def render_portal(frame, p1, p2, p3, p4, filtro):
     roi = frame[y1:y2, x1:x2]
     filtered = filtro(roi.copy())
 
-    # fillPoly, unlike fillConvexPoly, also handles a skewed concave quad.
+    # fillPoly also handles a skewed concave quad, fillConvexPoly does not
     mask = np.zeros(roi.shape[:2], dtype=np.uint8)
     cv2.fillPoly(mask, [pts - (x1, y1)], (255,))
 
@@ -475,7 +476,7 @@ def draw_label(frame, text, origin, scale=0.46):
     )
 
 
-# Start.
+# start
 
 print()
 print("==========================================")
@@ -492,7 +493,7 @@ print("Q / ESC = quit")
 print()
 
 
-# Main loop.
+# main loop
 
 try:
     while True:
@@ -517,10 +518,10 @@ try:
 
         track_frame = frame
 
-        if width > MAX_TRACK_WIDTH:
+        if width > max_track_width:
             track_frame = cv2.resize(
                 frame,
-                (MAX_TRACK_WIDTH, round(height * MAX_TRACK_WIDTH / width)),
+                (max_track_width, round(height * max_track_width / width)),
                 interpolation=cv2.INTER_AREA
             )
 
@@ -529,43 +530,43 @@ try:
             cv2.COLOR_BGR2RGB
         )
 
-        # Read-only input lets MediaPipe skip a copy.
+        # read only input lets mediapipe skip a copy
         rgb.flags.writeable = False
 
         hand_results = hands.process(rgb)
 
-        # Portal tracking.
+        # portal tracking
 
         corners = get_portal_corners(hand_results, width, height)
 
         if corners is not None:
 
-            if portal_seen_at is None or now - portal_seen_at > REFRAME_GAP:
+            if portal_seen_at is None or now - portal_seen_at > reframe_gap:
 
-                # A new framing: start smoothing fresh, and move on
-                # to the next filter (except for the very first one).
+                # a new framing, so start smoothing fresh and move on
+                # to the next filter, except for the very first one
                 corner_filter.reset()
 
                 if portal_seen_at is not None:
-                    filtro_index = (filtro_index + 1) % len(FILTROS)
+                    filtro_index = (filtro_index + 1) % len(filtros)
 
             portal = corner_filter(corners, now)
             portal_seen_at = now
 
-        elif portal_seen_at is None or now - portal_seen_at > HOLD_TIME:
+        elif portal_seen_at is None or now - portal_seen_at > hold_time:
             portal = None
 
-        filtro = FILTROS[filtro_index]
+        filtro = filtros[filtro_index]
 
         if portal is not None:
             p1, p2, p3, p4 = order_corners(portal)
             frame = render_portal(frame, p1, p2, p3, p4, filtro)
 
-        # Recording.
+        # recording
 
         if writer is not None:
 
-            # Write before drawing labels so the video stays clean.
+            # write before drawing labels so the video stays clean
             writer.write(frame)
 
             cv2.circle(
@@ -578,39 +579,39 @@ try:
 
             draw_label(frame, "REC", (width - 65, 30), 0.45)
 
-        # Status.
+        # status
 
-        status = f"{filtro_index + 1}/{len(FILTROS)}  {filter_name(filtro)}"
+        status = f"{filtro_index + 1}/{len(filtros)}  {filter_name(filtro)}"
 
         if portal is None:
             status = "FRAME WITH BOTH HANDS  //  NEXT: " + filter_name(filtro)
 
         draw_label(frame, status, (16, 28))
 
-        # Display.
+        # display
 
         cv2.imshow(
-            WINDOW_NAME,
+            window_name,
             frame
         )
 
         key = cv2.waitKey(1) & 0xFF
 
-        # Next filter.
+        # next filter
 
         if key in (ord("n"), ord("N"), ord(" ")):
-            filtro_index = (filtro_index + 1) % len(FILTROS)
+            filtro_index = (filtro_index + 1) % len(filtros)
 
-        # Toggle recording.
+        # toggle recording
 
         if key in (ord("r"), ord("R")):
 
             if writer is None:
 
-                os.makedirs(RECORDINGS_DIR, exist_ok=True)
+                os.makedirs(recordings_dir, exist_ok=True)
 
                 filename = os.path.join(
-                    RECORDINGS_DIR,
+                    recordings_dir,
                     "portal_"
                     + time.strftime("%Y%m%d_%H%M%S")
                     + ".mp4"
@@ -643,18 +644,18 @@ try:
 
                 print("Recording stopped.")
 
-        # Quit with Q, ESC, or the window close button.
+        # quit with q, esc or the window close button
 
         if key in (ord("q"), ord("Q"), 27):
             break
 
-        if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+        if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
             break
 
 finally:
 
-    # Cleanup, even after a crash, so the camera is freed
-    # and any recording is saved properly.
+    # cleanup, even after a crash, so the camera is freed
+    # and any recording is saved properly
 
     if writer is not None:
         writer.release()
