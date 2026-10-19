@@ -283,10 +283,13 @@ def halftone(image, cell, paper, ink):
     gray = cv2.equalizeHist(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
 
     # one dot per cell, bigger where the image is darker
+    # -(-w // cell) rounds up, so partly filled cells at the edges get a dot too
     cells_w = -(-w // cell)
     cells_h = -(-h // cell)
 
     small = cv2.resize(gray, (cells_w, cells_h), interpolation=cv2.INTER_AREA)
+
+    # map brightness to a dot size, the + 127 rounds to the nearest one
     levels = ((255 - small.astype(np.int32)) * (halftone_levels - 1) + 127) // 255
 
     # lay the matching dot tile into every cell, then trim to size
@@ -303,8 +306,10 @@ def blue_halftone(image):
 def wireframe_grid(image):
     out = cv2.convertScaleAbs(image, alpha=0.75, beta=0)
 
+    # about 14 lines across the short side, never closer than 12px
     step = max(12, min(image.shape[:2]) // 14)
 
+    # pull every grid row and column 80 percent towards white
     out[::step] = (out[::step] * 0.2 + 255 * 0.8).astype(np.uint8)
     out[:, ::step] = (out[:, ::step] * 0.2 + 255 * 0.8).astype(np.uint8)
 
@@ -621,6 +626,8 @@ try:
                     *"mp4v"
                 )
 
+                # the measured loop rate, or 30 before one is known,
+                # kept between 5 and 60 fps
                 record_fps = float(np.clip(round(fps or 30), 5, 60))
 
                 writer = cv2.VideoWriter(

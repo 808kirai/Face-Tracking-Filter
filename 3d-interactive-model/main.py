@@ -1,13 +1,13 @@
 import pyvista as pv
 
-# Create the viewer.
+# viewer window with a dark navy background
 plotter = pv.Plotter(window_size=[1024, 768], title="3D Interactive Viewer")
 plotter.set_background("#0f172a")
 
-# Build the 3D object.
+# the 3d object
 mesh = pv.Icosahedron(radius=1.5)
 
-# Add the mesh with metallic shading.
+# pbr shading gives the metal look, low roughness keeps it shiny
 plotter.add_mesh(
     mesh,
     color="#3b82f6",
@@ -17,8 +17,8 @@ plotter.add_mesh(
     smooth_shading=True,
 )
 
-# Add the key light.
+# one bright key light from the upper front corner
 plotter.add_light(pv.Light(position=(5, 5, 5), intensity=1.5, color="white"))
 
-# Open the viewer.
+# opens the window and blocks until it is closed
 plotter.show()
