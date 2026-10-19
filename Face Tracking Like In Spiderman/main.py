@@ -147,7 +147,7 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 camera = camera_stream(cap)
 last_frame = 0
 
-# smooths the 4 fingertip corners in the order left thumb, left index,
+# smoothens the 4 fingertip corners in the order left thumb, left index,
 # right thumb, right index
 corner_filter = one_euro_filter(min_cutoff=0.5, beta=0.01)
 
